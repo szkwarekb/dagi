@@ -1,0 +1,631 @@
+import os
+import time
+import json
+import base64
+import tempfile
+import zipfile
+import re
+import glob
+import shutil
+import logging
+from datetime import datetime, timedelta
+from lxml import etree
+
+import requests
+import msal
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
+from airflow.exceptions import AirflowSkipException
+from airflow.utils.dates import days_ago
+
+# Ustawienia domyślne dla DAGa
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=1),
+}
+
+# Definicje delimiter'ów
+DELIM_RAW = "<<<@@@DELIM@@@>>>"
+DELIM_HTML = f'<span translate="no">{DELIM_RAW}</span>'
+
+# Nowa funkcja szacująca koszt tłumaczenia na podstawie liczby znaków
+
+def estimate_translation_cost(text):
+    cost_per_million_str = Variable.get("translator.cost_per_million", default_var="6.51")
+    cost_per_million = float(cost_per_million_str.replace(",", "."))
+    num_chars = len(text)
+    estimated_cost = (num_chars / 1000000) * cost_per_million
+    return f"Szacowany koszt tłumaczenia: {estimated_cost:.2f} PLN"
+
+
+with DAG(
+    'Translator',
+    default_args=default_args,
+    description='DAG pobierający maile, przetwarzający załączniki i tłumaczący ich zawartość',
+    schedule_interval="* * * * *",  # uruchamianie co minutę
+    start_date=days_ago(1),
+    catchup=False,
+    concurrency=5,
+    tags=["ai_prod"]
+) as dag:
+
+    # ---------------------------
+    # FUNKCJE POMOCNICZE
+    # ---------------------------
+    def get_graph_api_token():
+        tenant_id = Variable.get("order.tenant_id")
+        client_id = Variable.get("order.client_id")
+        client_secret = Variable.get("order.client_secret")
+        authority = f"https://login.microsoftonline.com/{tenant_id}"
+        app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
+        result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        if not result or "access_token" not in result:
+            logging.error("Nie udało się uzyskać tokenu Graph API.")
+            raise Exception("Brak tokenu Graph API")
+        logging.info("Uzyskano token Graph API.")
+        return result["access_token"]
+
+    def get_unread_messages(token):
+        email_account = Variable.get("translate_mailbox_email")
+        url = f"https://graph.microsoft.com/v1.0/users/{email_account}/messages?$filter=isRead eq false and hasAttachments eq true"
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            logging.error(f"Błąd pobierania wiadomości: {response.text}")
+            raise Exception("Błąd pobierania wiadomości")
+        messages = response.json().get("value", [])
+        logging.info(f"Znaleziono {len(messages)} nieprzeczytanych wiadomości z załącznikami.")
+        return messages
+
+    def move_message(message_id, destination_folder, token):
+        email_account = Variable.get("translate_mailbox_email")
+        url = f"https://graph.microsoft.com/v1.0/users/{email_account}/messages/{message_id}/move"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        data = {"destinationId": destination_folder}
+        response = requests.post(url, headers=headers, json=data)
+        if response.status_code not in [200, 201]:
+            logging.error(f"Błąd przenoszenia wiadomości {message_id}: {response.text}")
+            raise Exception(f"Błąd przenoszenia wiadomości {message_id}")
+        logging.info(f"Wiadomość {message_id} przeniesiona do folderu {destination_folder}.")
+        return response.json()
+
+    def mark_message_as_read(message_id, token):
+        email_account = Variable.get("translate_mailbox_email")
+        url = f"https://graph.microsoft.com/v1.0/users/{email_account}/messages/{message_id}"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        data = {"isRead": True}
+        response = requests.patch(url, headers=headers, json=data)
+        if response.status_code != 200:
+            logging.error(f"Błąd oznaczania wiadomości jako przeczytanej: {response.text}")
+            raise Exception("Błąd oznaczania wiadomości jako przeczytanej")
+        logging.info(f"Wiadomość {message_id} została oznaczona jako przeczytana.")
+        return True
+
+    def get_attachments(message_id, token):
+        email_account = Variable.get("translate_mailbox_email")
+        url = f"https://graph.microsoft.com/v1.0/users/{email_account}/messages/{message_id}/attachments"
+        headers = {"Authorization": f"Bearer {token}"}
+        response = requests.get(url, headers=headers)
+        if response.status_code != 200:
+            logging.error(f"Błąd pobierania załączników wiadomości {message_id}: {response.text}")
+            raise Exception("Błąd pobierania załączników")
+        attachments = response.json().get("value", [])
+        logging.info(f"Znaleziono {len(attachments)} załączników w wiadomości {message_id}.")
+        return attachments
+
+    def clean_text(text):
+        text = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F]', '', text)
+        text = text.replace('\u2028', ' ').replace('\u2029', ' ')
+        return text.strip()
+
+    def send_translation_request(texts_batch, params, constructed_url, headers):
+        body = [{'text': text} for text in texts_batch]
+        max_retries = 5
+        retry_delay = 5
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(constructed_url, headers=headers, params=params, json=body)
+                if response.status_code == 429:
+                    logging.warning(f"Błąd 429: Zbyt wiele żądań. Próba {attempt+1} z {max_retries}.")
+                    wait_time = int(response.headers.get('Retry-After', retry_delay))
+                    logging.info(f"Oczekiwanie {wait_time} sekund przed ponowną próbą.")
+                    time.sleep(wait_time)
+                    continue
+                response.raise_for_status()
+                translations = response.json()
+                return [item['translations'][0]['text'] for item in translations]
+            except requests.exceptions.HTTPError as err:
+                logging.error(f"HTTP error occurred: {err.response.text}")
+                raise
+        raise Exception("Nie udało się przetłumaczyć tekstu po maksymalnej liczbie prób.")
+
+    # ---------------------------
+    # FUNKCJE POMOCNICZE DLA PRZETWARZANIA TEKSTU
+    # ---------------------------
+    def chunk_translatable_texts(text_segments, delim_markup, max_chars):
+        """Dzieli listę segmentów tekstu na mniejsze grupy, których łączna długość nie przekracza max_chars."""
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        for seg in text_segments:
+            seg_len = len(seg)
+            if current_chunk:
+                seg_len += len(delim_markup)
+            if current_length + seg_len > max_chars and current_chunk:
+                chunks.append(delim_markup.join(current_chunk))
+                current_chunk = [seg]
+                current_length = len(seg)
+            else:
+                current_chunk.append(seg)
+                current_length += seg_len
+        if current_chunk:
+            chunks.append(delim_markup.join(current_chunk))
+        return chunks
+
+    def translate_texts_preserve_structure(text_segments, target_lang, delim=DELIM_RAW, max_chars=5000):
+        """
+        Łączy segmenty tekstu z użyciem znaczników HTML (które nie są tłumaczone), tłumaczy blok,
+        następnie usuwa znaczniki i dzieli wynik na oryginalne segmenty.
+        """
+        delim_markup = f'<span translate="no">{delim}</span>'
+        chunks = chunk_translatable_texts(text_segments, delim_markup, max_chars)
+        translated_segments = []
+        for chunk in chunks:
+            translated_chunk = azure_translate([chunk], target_lang)[0]
+            cleaned_chunk = re.sub(r'</?span[^>]*>', '', translated_chunk)
+            segments = cleaned_chunk.split(delim)
+            translated_segments.extend(segments)
+        return translated_segments
+
+    # ---------------------------
+    # FUNKCJE TŁUMACZENIA – Z MODYFIKACJĄ ZACHOWANIA STRUKTURY XML
+    # ---------------------------
+    def azure_translate(texts, target_lang):
+        subscription_key = Variable.get("translator.TRANSLATOR_SUBSCRIPTION_KEY")
+        region = Variable.get("translator.TRANSLATOR_REGION")
+        endpoint = 'https://api.cognitive.microsofttranslator.com'
+        headers = {
+            'Ocp-Apim-Subscription-Key': subscription_key,
+            'Ocp-Apim-Subscription-Region': region,
+            'Content-Type': 'application/json'
+        }
+        path = '/translate?api-version=3.0'
+        constructed_url = endpoint + path
+        params = {'to': target_lang, 'textType': 'html'}
+        max_chars_per_request = 5000
+        max_texts_per_request = 50
+        translated_texts = []
+        current_batch = []
+        current_chars = 0
+
+        texts = [clean_text(text) for text in texts if text.strip()]
+        total_chars = sum(len(text) for text in texts)
+        logging.info(f"Przygotowanie do tłumaczenia {len(texts)} tekstów na język {target_lang}. Łączna liczba znaków: {total_chars}")
+
+        for text in texts:
+            text_length = len(text)
+            if text_length > max_chars_per_request:
+                logging.warning(f"Tekst przekracza maksymalną długość i zostanie pominięty: {text[:50]}...")
+                continue
+            if current_chars + text_length > max_chars_per_request or len(current_batch) >= max_texts_per_request:
+                translated_texts.extend(send_translation_request(current_batch, params, constructed_url, headers))
+                current_batch = []
+                current_chars = 0
+                time.sleep(1)
+            current_batch.append(text)
+            current_chars += text_length
+        if current_batch:
+            translated_texts.extend(send_translation_request(current_batch, params, constructed_url, headers))
+        return translated_texts
+
+    def translate_text_in_xml(xml_file, target_lang):
+        parser = etree.XMLParser(remove_blank_text=True)
+        tree = etree.parse(xml_file, parser)
+        root = tree.getroot()
+        text_elements = []
+        elements = []
+        for elem in root.iter():
+            if elem.text and elem.text.strip():
+                text_elements.append(elem.text.strip())
+                elements.append(elem)
+        if text_elements:
+            translated_texts = translate_texts_preserve_structure(text_elements, target_lang, delim=DELIM_RAW, max_chars=5000)
+            if len(translated_texts) != len(elements):
+                logging.warning("Liczba przetłumaczonych segmentów nie zgadza się z oryginałem!")
+            for elem, t_text in zip(elements, translated_texts):
+                elem.text = t_text
+            tree.write(xml_file, pretty_print=True, encoding='utf-8', xml_declaration=True)
+
+    def translate_text_in_shared_strings(xml_file, target_lang):
+        parser = etree.XMLParser(remove_blank_text=True)
+        tree = etree.parse(xml_file, parser)
+        root = tree.getroot()
+        namespaces = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        t_elements = root.findall('.//ns:t', namespaces=namespaces)
+        text_elements = []
+        for elem in t_elements:
+            if elem.text and elem.text.strip():
+                text_elements.append(elem.text.strip())
+        if text_elements:
+            translated_texts = translate_texts_preserve_structure(text_elements, target_lang, delim=DELIM_RAW, max_chars=5000)
+            for elem, t_text in zip(t_elements, translated_texts):
+                elem.text = t_text
+            tree.write(xml_file, pretty_print=True, encoding='utf-8', xml_declaration=True)
+
+    def unzip_file(file_path, extract_to):
+        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_to)
+        logging.info(f"Rozpakowano plik {file_path} do folderu {extract_to}.")
+
+    def extract_text_from_xml_generic(xml_file):
+        parser = etree.XMLParser(remove_blank_text=True)
+        tree = etree.parse(xml_file, parser)
+        root = tree.getroot()
+        texts = []
+        for elem in root.iter():
+            if elem.text and elem.text.strip():
+                texts.append(elem.text.strip())
+        return ' '.join(texts)
+
+    def extract_text_from_shared_strings(xml_file, max_strings=10):
+        parser = etree.XMLParser(remove_blank_text=True)
+        tree = etree.parse(xml_file, parser)
+        root = tree.getroot()
+        namespaces = {'ns': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        t_elements = root.findall('.//ns:t', namespaces=namespaces)
+        texts = []
+        for elem in t_elements[:max_strings]:
+            if elem.text and elem.text.strip():
+                texts.append(elem.text.strip())
+        return ' '.join(texts)
+
+    def zip_file_func(output_zip, extracted_folder):
+        with zipfile.ZipFile(output_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for foldername, subfolders, filenames in os.walk(extracted_folder):
+                for filename in filenames:
+                    file_path = os.path.join(foldername, filename)
+                    zipf.write(file_path, os.path.relpath(file_path, extracted_folder))
+        logging.info(f"Spakowano pliki z folderu {extracted_folder} do pliku {output_zip}.")
+
+    def translate_all_slides(extracted_folder, target_lang):
+        slides_path = os.path.join(extracted_folder, 'ppt', 'slides')
+        slide_files = glob.glob(os.path.join(slides_path, 'slide*.xml'))
+        for slide_file in slide_files:
+            if re.match(r'.*/slide\d+\.xml$', slide_file):
+                translate_text_in_xml(slide_file, target_lang)
+
+    # ---------------------------
+    # Modyfikacja – translate_attachment zwraca dodatkowe dane techniczne
+    # ---------------------------
+    def translate_attachment(file_content_base64, file_name, provided_target_lang):
+        file_extension = file_name.split('.')[-1]
+        temp_dir = tempfile.gettempdir()
+        input_file_path = os.path.join(temp_dir, f"input_file.{file_extension}")
+        with open(input_file_path, 'wb') as f:
+            f.write(base64.b64decode(file_content_base64))
+        logging.info(f"Zapisano załącznik do pliku {input_file_path}.")
+        extracted_folder = os.path.join(temp_dir, "extracted")
+        if os.path.exists(extracted_folder):
+            shutil.rmtree(extracted_folder)
+        os.makedirs(extracted_folder, exist_ok=True)
+        unzip_file(input_file_path, extracted_folder)
+
+        if file_extension == 'docx':
+            document_xml = os.path.join(extracted_folder, 'word', 'document.xml')
+            fragment = extract_text_from_xml_generic(document_xml)
+        elif file_extension == 'pptx':
+            slides_path = os.path.join(extracted_folder, 'ppt', 'slides')
+            slide_files = glob.glob(os.path.join(slides_path, 'slide*.xml'))
+            fragment = ""
+            for slide_file in slide_files:
+                fragment += extract_text_from_xml_generic(slide_file) + " "
+        elif file_extension == 'xlsx':
+            shared_strings_xml = os.path.join(extracted_folder, 'xl', 'sharedStrings.xml')
+            if not os.path.exists(shared_strings_xml):
+                raise Exception("Plik sharedStrings.xml nie został znaleziony w pliku Excel.")
+            fragment = extract_text_from_shared_strings(shared_strings_xml, max_strings=10)
+        else:
+            raise Exception(f"Nieobsługiwane rozszerzenie pliku: {file_extension}")
+
+        if not fragment.strip():
+            raise Exception("Nie znaleziono tekstu w dokumencie do wykrycia języka.")
+
+        detected_language = detect_language(fragment)
+        logging.info(f"Wykryto język: {detected_language}.")
+        # Dodanie szacowania kosztu tłumaczenia do szczegółów
+        translation_details = (
+            f"Przygotowanie do tłumaczenia {len(fragment.split())} słów. "
+            f"Łączna liczba znaków: {len(fragment)}. "
+            f"{estimate_translation_cost(fragment)} "
+        )
+        
+        if not provided_target_lang:
+            if detected_language == 'pl':
+                logging.info("Wykryto język polski. Tłumaczenie na angielski (pl → en).")
+                target_lang = 'en'
+                translation_required = True
+            else:
+                logging.info(f"Wykryto język {detected_language}. Tłumaczenie na polski (dowolny → pl).")
+                target_lang = 'pl'
+                translation_required = True
+        else:
+            logging.info(f"Używanie podanego języka docelowego: {provided_target_lang}.")
+            target_lang = provided_target_lang
+            if provided_target_lang == detected_language:
+                logging.info("Kod języka docelowego jest równy wykrytemu językowi. Tłumaczenie pominięte.")
+                translation_required = False
+            else:
+                translation_required = True
+
+        if translation_required:
+            if file_extension == 'docx':
+                document_xml = os.path.join(extracted_folder, 'word', 'document.xml')
+                translate_text_in_xml(document_xml, target_lang)
+            elif file_extension == 'pptx':
+                translate_all_slides(extracted_folder, target_lang)
+            elif file_extension == 'xlsx':
+                shared_strings_xml = os.path.join(extracted_folder, 'xl', 'sharedStrings.xml')
+                translate_text_in_shared_strings(shared_strings_xml, target_lang)
+        else:
+            logging.info("Tłumaczenie pominięte, ponieważ dokument jest już w zadanym języku.")
+
+        output_file_path = os.path.join(temp_dir, f"translated_file.{file_extension}")
+        zip_file_func(output_file_path, extracted_folder)
+        with open(output_file_path, 'rb') as f:
+            translated_file_content = f.read()
+        encoded_translated = base64.b64encode(translated_file_content).decode('utf-8')
+        logging.info(f"Załącznik {file_name} został przetłumaczony (lub pozostawiony bez zmian).")
+        return {
+            "encoded_translated": encoded_translated,
+            "detected_language": detected_language,
+            "translation_details": translation_details,
+            "target_lang": target_lang
+        }
+
+    def process_attachment(attachment, token, target_lang):
+        file_name = attachment.get("name", "")
+        logging.info(f"Przetwarzanie załącznika: {file_name}")
+        if not (file_name.endswith(".pptx") or file_name.endswith(".xlsx") or file_name.endswith(".docx")):
+            logging.warning(f"Załącznik {file_name} ma niepoprawny format.")
+            return {"status": "invalid", "file_name": file_name}
+        file_content_base64 = attachment.get("contentBytes", None)
+        if not file_content_base64:
+            logging.error(f"Brak zawartości załącznika {file_name}.")
+            return {"status": "error", "file_name": file_name, "error": "Brak zawartości"}
+        try:
+            result = translate_attachment(file_content_base64, file_name, target_lang)
+            return {
+                "status": "translated",
+                "file_name": file_name,
+                "translated_content": result["encoded_translated"],
+                "target_lang": result["target_lang"],
+                "detected_language": result["detected_language"],
+                "translation_details": result["translation_details"]
+            }
+        except Exception as e:
+            logging.error(f"Błąd tłumaczenia załącznika {file_name}: {str(e)}")
+            return {"status": "error", "file_name": file_name, "error": str(e)}
+
+    def send_email_via_graph(token, subject, body, to, attachments=None):
+        email_account = Variable.get("translate_mailbox_email")
+        url = f"https://graph.microsoft.com/v1.0/users/{email_account}/sendMail"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        message = {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": body},
+            "toRecipients": [{"emailAddress": {"address": to}}]
+        }
+        if attachments:
+            message["attachments"] = []
+            for att in attachments:
+                message["attachments"].append({
+                    "@odata.type": "#microsoft.graph.fileAttachment",
+                    "name": att["name"],
+                    "contentBytes": att["contentBytes"]
+                })
+        payload = {"message": message, "saveToSentItems": "true"}
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code not in [202, 200]:
+            logging.error(f"Błąd wysyłania emaila: {response.text}")
+            raise Exception("Błąd wysyłania emaila")
+        logging.info("Email został wysłany pomyślnie.")
+
+    def detect_language(text):
+        subscription_key = Variable.get("translator.TRANSLATOR_SUBSCRIPTION_KEY")
+        region = Variable.get("translator.TRANSLATOR_REGION")
+        endpoint = 'https://api.cognitive.microsofttranslator.com'
+        headers = {
+            'Ocp-Apim-Subscription-Key': subscription_key,
+            'Ocp-Apim-Subscription-Region': region,
+            'Content-Type': 'application/json'
+        }
+        path = '/detect?api-version=3.0'
+        constructed_url = endpoint + path
+        body = [{'text': text}]
+        try:
+            response = requests.post(constructed_url, headers=headers, json=body)
+            response.raise_for_status()
+            language_info = response.json()
+            detected = language_info[0]['language']
+            logging.info(f"Język wykryty: {detected}")
+            return detected
+        except requests.exceptions.HTTPError as err:
+            logging.error(f"HTTP error during language detection: {err.response.text}")
+            raise
+
+    # ---------------------------
+    # TASKI DAGa
+    # ---------------------------
+
+    def task_sprawdz_wiadomosci(**context):
+        token = get_graph_api_token()
+        messages = get_unread_messages(token)
+        if not messages:
+            logging.info("Brak nieprzeczytanych wiadomości z załącznikami.")
+            raise AirflowSkipException("Brak nieprzeczytanych wiadomości.")
+        message = messages[0]
+        logging.info(f"Wybrano wiadomość {message.get('id')} od {message.get('from', {}).get('emailAddress', {}).get('address')}.")
+        context['ti'].xcom_push(key='message', value=message)
+        context['ti'].xcom_push(key='graph_token', value=token)
+        return message.get('id')
+
+
+    def task_przenies_do_inprogress(**context):
+        ti = context['ti']
+        token = ti.xcom_pull(key='graph_token')
+        message = ti.xcom_pull(key='message')
+        if not message:
+            logging.info("Brak wiadomości do przeniesienia.")
+            return
+        message_id = message.get('id')
+        folder_inprogress = Variable.get("translator.folder_inprogress")
+        moved_message = move_message(message_id, folder_inprogress, token)
+        new_message_id = moved_message.get('id')
+        logging.info(f"Nowy identyfikator wiadomości: {new_message_id}")
+        ti.xcom_push(key='message_id', value=new_message_id)
+        return new_message_id
+
+    def task_przetwarzanie_zalacznikow(**context):
+        ti = context['ti']
+        token = ti.xcom_pull(key='graph_token')
+        message_id = ti.xcom_pull(key='message_id')
+        if not message_id:
+            raise Exception("Brak zaktualizowanego identyfikatora wiadomości w XCom")
+        attachments = get_attachments(message_id, token)
+        message = ti.xcom_pull(key='message')
+        subject = message.get('subject', '').strip() if message else ""
+        allowed_langs = ["pl", "en", "de", "fr", "es", "it", "zh", "ja", "ko", "pt", "ar", "nl", "sv", "tr", "no", "da", "fi", "el", "cs", "hu", "he", "th", "vi", "vn"]
+        target_lang = ""
+        for code in allowed_langs:
+            if code.lower() in subject.lower().split():
+                target_lang = code.lower()
+                break
+        logging.info(f"Określony kod języka z tematu: {target_lang if target_lang else 'brak, użyta domyślna logika'}")
+        results = []
+        for att in attachments:
+            wynik = process_attachment(att, token, target_lang)
+            results.append(wynik)
+        logging.info(f"Wyniki przetwarzania załączników: {results}")
+        ti.xcom_push(key='attachment_results', value=results)
+        sender = message.get('from', {}).get('emailAddress', {}).get('address') if message else ""
+        ti.xcom_push(key='sender', value=sender)
+        return results
+
+    def task_wyslij_email(**context):
+        ti = context['ti']
+        token = ti.xcom_pull(key='graph_token')
+        results = ti.xcom_pull(key='attachment_results')
+        sender = ti.xcom_pull(key='sender')
+        if not sender:
+            raise Exception("Nie znaleziono adresu nadawcy")
+        for res in results:
+            if not isinstance(res, dict) or 'status' not in res:
+                logging.error(f"Nieprawidłowy format wyniku: {res}")
+                continue
+            if res['status'] == 'translated':
+                subject = f"Tłumaczenie dokumentu: {res['file_name']}"
+                body = (
+                    f"<html><body>"
+                    f"<p>Szanowny Kliencie,</p>"
+                    f"<p>Twoje zgłoszenie dotyczące tłumaczenia załącznika <strong>{res['file_name']}</strong> zostało zakończone sukcesem.</p>"
+                    f"<h3>Szczegóły tłumaczenia:</h3>"
+                    f"<ul>"
+                    f"<li>Wykryty język: {res.get('detected_language', 'nieznany')}</li>"
+                    f"<li>Język tłumaczenia: {res['target_lang']}</li>"
+                    f"<li>{res.get('translation_details', '')}</li>"
+                    f"</ul>"
+                    f"<p>Nasza usługa automatycznie tłumaczy dokumenty na język polski, o ile wykryty język nie jest już polski. "
+                    f"Jeśli chcesz, możesz określić inny język docelowy, wpisując kod języka w temacie wiadomości.</p>"
+                    f"<h4>Przykładowe kody językowe:</h4>"
+                    f"<p>pl – polski, en – angielski, de – niemiecki, fr – francuski, es – hiszpański, it – włoski, zh – chiński, "
+                    f"ja – japoński, ko – koreański, pt – portugalski, ar – arabski, nl – niderlandzki, sv – szwedzki, tr – turecki, vn – wietnamski.</p>"
+                    f"<p>Przetłumaczony dokument znajdziesz w załączniku.</p>"
+                    f"<p>W razie jakichkolwiek pytań lub wątpliwości prosimy o kontakt z działem IT.</p>"
+                    f"<p>Pozdrawiamy,<br>Dział IT</p>"
+                    f"</body></html>"
+                )
+                attachments = [{
+                    "name": res['file_name'],
+                    "contentBytes": res['translated_content']
+                }]
+                send_email_via_graph(token, subject, body, sender, attachments)
+            elif res['status'] == 'invalid':
+                subject = "Niepoprawny format załącznika"
+                body = (
+                    f"<html><body>"
+                    f"<p>Szanowny Kliencie,</p>"
+                    f"<p>Załącznik <strong>{res['file_name']}</strong> nie jest obsługiwanym formatem. "
+                    f"Obsługujemy formaty: .pptx, .xlsx, .docx.</p>"
+                    f"<p>W razie pytań prosimy o kontakt z działem IT.</p>"
+                    f"<p>Pozdrawiamy,<br>Dział IT</p>"
+                    f"</body></html>"
+                )
+                send_email_via_graph(token, subject, body, sender)
+            elif res['status'] == 'error':
+                subject = "Błąd tłumaczenia dokumentu"
+                body = (
+                    f"<html><body>"
+                    f"<p>Szanowny Kliencie,</p>"
+                    f"<p>Podczas próby tłumaczenia załącznika <strong>{res['file_name']}</strong> wystąpił błąd:</p>"
+                    f"<p><em>{res['error']}</em></p>"
+                    f"<p>Prosimy o ponowne przesłanie dokumentu lub kontakt z działem IT.</p>"
+                    f"<p>Pozdrawiamy,<br>Dział IT</p>"
+                    f"</body></html>"
+                )
+                send_email_via_graph(token, subject, body, sender)
+        return True
+
+    def task_przenies_do_folderu_end(**context):
+        ti = context['ti']
+        token = ti.xcom_pull(key='graph_token')
+        updated_message_id = ti.xcom_pull(key='message_id')
+        if not updated_message_id:
+            logging.info("Brak zaktualizowanego identyfikatora wiadomości do przeniesienia do folderu end.")
+            return
+        folder_end = Variable.get("translator.folder_end")
+        moved_message = move_message(updated_message_id, folder_end, token)
+        new_message_id = moved_message.get('id')
+        if not new_message_id:
+            logging.warning("Nowy identyfikator wiadomości nie został zwrócony po przeniesieniu do folderu end.")
+            new_message_id = updated_message_id
+        mark_message_as_read(new_message_id, token)
+        return new_message_id
+
+    # ---------------------------
+    # DEFINICJA PRZEPŁYWU DAGa
+    # ---------------------------
+    t1 = PythonOperator(
+        task_id='sprawdz_wiadomosci',
+        python_callable=task_sprawdz_wiadomosci,
+        provide_context=True,
+    )
+
+    t2 = PythonOperator(
+        task_id='przenies_do_inprogress',
+        python_callable=task_przenies_do_inprogress,
+        provide_context=True,
+    )
+
+    t3 = PythonOperator(
+        task_id='przetwarzanie_zalacznikow',
+        python_callable=task_przetwarzanie_zalacznikow,
+        provide_context=True,
+    )
+
+    t4 = PythonOperator(
+        task_id='wyslij_email',
+        python_callable=task_wyslij_email,
+        provide_context=True,
+    )
+
+    t5 = PythonOperator(
+        task_id='przenies_do_folderu_end',
+        python_callable=task_przenies_do_folderu_end,
+        provide_context=True,
+    )
+
+    t1 >> t2 >> t3 >> t4 >> t5
