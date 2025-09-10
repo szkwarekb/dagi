@@ -1,0 +1,691 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.models import Variable
+from airflow.utils.dates import days_ago
+from airflow.exceptions import AirflowSkipException
+
+import base64
+import msal
+import requests
+from azure.ai.formrecognizer import DocumentAnalysisClient
+from azure.core.credentials import AzureKeyCredential
+import pymysql
+from rapidfuzz import process, fuzz
+from PyPDF2 import PdfReader, PdfWriter
+import time
+import io
+from io import BytesIO
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+import logging
+import json
+import re
+
+# Funkcja pomocnicza czyszcząca wartość liczbową
+def clean_numeric_value(value, default=""):
+    """
+    Usuwa wszystkie białe znaki (w tym spacje, tabulatory, nowe linie oraz non-breaking space)
+    oraz znaki niebędące cyframi (pozwalając na kropkę) z przekazanej wartości.
+    Zamienia przecinek na kropkę i próbuje przekonwertować wynik na float.
+    W przypadku problemu zwraca default.
+    """
+    try:
+        value_str = str(value)
+        # Usuwamy standardowe białe znaki oraz non-breaking space (Unicode U+00A0)
+        value_str = re.sub(r"[\s\u00A0]+", "", value_str)
+        if not value_str:
+            return default
+        value_str = value_str.replace(",", ".")
+        value_clean = re.sub(r"[^0-9\.]", "", value_str)
+        if not value_clean:
+            return default
+        return float(value_clean)
+    except Exception as e:
+        logging.error(f"Błąd konwersji wartości '{value}': {e}")
+        return default
+
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'retries': 0
+}
+
+with DAG(
+    dag_id="Przetwarzanie_Zamowien1.5_poprawiony",
+    default_args=default_args,
+    description="DAG do przetwarzania zamówień – analiza PDF/obrazów, dopasowanie, generacja plików Excel oraz wysyłka maila",
+    schedule_interval="* * * * *",  # uruchamianie co minutę
+    start_date=days_ago(1),
+    catchup=False,
+    concurrency=5,
+    tags=["ai_prod"]
+) as dag:
+
+    # Funkcja wysyłki e-maili przez MS Graph
+    def send_email_ms_graph(to: str, subject: str, html_content: str, attachments: list = None):
+        tenant_id = Variable.get("order.tenant_id")
+        client_id = Variable.get("order.client_id")
+        client_secret = Variable.get("order.client_secret")
+        email_account = Variable.get("order.email_account")
+        authority = f"https://login.microsoftonline.com/{tenant_id}"
+        app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
+        result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+        if not result or "access_token" not in result:
+            raise Exception("Błąd uwierzytelnienia w Microsoft Graph (email)")
+        token = result["access_token"]
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        graph_url = f"https://graph.microsoft.com/v1.0/users/{email_account}/sendMail"
+        email_data = {
+            "message": {
+                "subject": subject,
+                "body": {"contentType": "HTML", "content": html_content},
+                "toRecipients": [{"emailAddress": {"address": to}}]
+            },
+            "saveToSentItems": "true"
+        }
+        if attachments:
+            email_data["message"]["attachments"] = attachments
+        time.sleep(5)
+        response = requests.post(graph_url, headers=headers, json=email_data)
+        if response.status_code != 202:
+            raise Exception(f"Błąd wysyłania e-maila przez MS Graph: {response.text}")
+
+    # Funkcja generująca plik Excel (raw)
+    def generate_excel_additional_raw(rows: list) -> bytes:
+        headers = ["KOD PRODUKTU", "KOD EAN", "KOD KLIENTA", "ILOSC"]
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "ListaTowarow"
+        for col_index, header in enumerate(headers, start=1):
+            ws.cell(row=1, column=col_index, value=header)
+        for row_index, data in enumerate(rows, start=2):
+            ws.cell(row=row_index, column=1, value=str(data.get("RWLKOD", ""))).number_format = "@"
+            ean = data.get("EAN", "")
+            val_ean = clean_numeric_value(ean, default=str(ean))
+            ws.cell(row=row_index, column=2, value=val_ean).number_format = "0"
+            ws.cell(row=row_index, column=3, value=str(data.get("ZAMKOD", ""))).number_format = "@"
+            ilosc = data.get("ILOSC", "")
+            numeric_ilosc = clean_numeric_value(ilosc, default=0)
+            ws.cell(row=row_index, column=4, value=numeric_ilosc).number_format = "#,##0.00"
+        output = io.BytesIO()
+        wb.save(output)
+        return output.getvalue()
+
+    # Funkcja generująca plik Excel (dopasowany fuzzy)
+    def generate_excel_additional_fuzzy(rows: list) -> bytes:
+        headers = ["KOD PRODUKTU", "KOD EAN", "KOD KLIENTA", "ILOSC"]
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "DodatkowyFuzzy"
+        for col_index, header in enumerate(headers, start=1):
+            ws.cell(row=1, column=col_index, value=header)
+        for row_index, data in enumerate(rows, start=2):
+            ws.cell(row=row_index, column=1, value=str(data.get("KOD PRODUKTU", ""))).number_format = "@"
+            ean = data.get("KOD EAN", "")
+            val_ean = clean_numeric_value(ean, default=str(ean))
+            ws.cell(row=row_index, column=2, value=val_ean).number_format = "0"
+            ws.cell(row=row_index, column=3, value=str(data.get("KOD KLIENTA", ""))).number_format = "@"
+            ilosc = data.get("ILOSC", "")
+            numeric_ilosc = clean_numeric_value(ilosc, default=0)
+            ws.cell(row=row_index, column=4, value=numeric_ilosc).number_format = "#,##0.00"
+        output = io.BytesIO()
+        wb.save(output)
+        return output.getvalue()
+
+    # Funkcja dzieląca PDF na strony
+    def split_pdf_pages(pdf_bytes: bytes) -> list:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        pages = []
+        for i in range(len(reader.pages)):
+            writer = PdfWriter()
+            writer.add_page(reader.pages[i])
+            output = BytesIO()
+            writer.write(output)
+            output.seek(0)
+            pages.append(output.getvalue())
+        return pages
+
+    # Funkcja bezpiecznego pobierania wartości z pola dokumentu
+    def safe_field_value(fields_dict, field_name):
+        f = fields_dict.get(field_name)
+        return f.value if f and hasattr(f, "value") and f.value is not None else ""
+
+    # Task 1: Pobieranie maili i załączników
+    def pobierz_maile(**kwargs):
+        try:
+            logging.info("Rozpoczynam pobieranie maili...")
+            tenant_id = Variable.get("order.tenant_id")
+            client_id = Variable.get("order.client_id")
+            client_secret = Variable.get("order.client_secret")
+            email_account = Variable.get("order.email_account")
+            email_folder = Variable.get("order.email_folder", default_var="Inbox")
+            authority = f"https://login.microsoftonline.com/{tenant_id}"
+            app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
+            result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+            if not result or "access_token" not in result:
+                raise Exception("Błąd uwierzytelnienia w Microsoft Graph")
+            token = result["access_token"]
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            query_params = "?$filter=isRead eq false and hasAttachments eq true&$top=1"
+            url = f"https://graph.microsoft.com/v1.0/users/{email_account}/mailFolders/{email_folder}/messages{query_params}"
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            messages = response.json().get('value', [])
+            if not messages:
+                logging.info("Nie znaleziono nowych maili. Oczekiwanie na kolejne wywołanie przez scheduler.")
+                raise AirflowSkipException("Brak maila do przetworzenia")
+            message = messages[0]
+            msg_id = message['id']
+            sender_email = (message.get('from', {}).get('emailAddress', {}).get('address')) or \
+                           (message.get('sender', {}).get('emailAddress', {}).get('address'))
+            logging.info(f"Znaleziono mail od: {sender_email}, ID: {msg_id}")
+
+            # Przenoszenie maila do folderu "inprogress"
+            inprogress_folder_id = Variable.get("order.inprogress_folder_id")
+            move_url = f"https://graph.microsoft.com/v1.0/users/{email_account}/messages/{msg_id}/move"
+            move_data = {"destinationId": inprogress_folder_id}
+            move_resp = requests.post(move_url, headers=headers, json=move_data)
+            move_resp.raise_for_status()
+            moved_message = move_resp.json()
+            new_msg_id = moved_message.get("id")
+            if new_msg_id:
+                msg_id = new_msg_id
+            logging.info("Mail przeniesiony do folderu 'inprogress'.")
+
+            # Pobieranie załączników
+            attach_url = f"https://graph.microsoft.com/v1.0/users/{email_account}/messages/{msg_id}/attachments"
+            attach_resp = requests.get(attach_url, headers=headers)
+            attach_resp.raise_for_status()
+            attachments = attach_resp.json().get('value', [])
+            
+            valid_files = []
+            acceptable_content_types = [
+                "application/pdf",
+                "image/jpeg", "image/jpg",
+                "image/png",
+                "image/tiff", "image/tif",
+                "image/bmp",
+                "image/heic", "image/heif",
+                "image/webp",
+                "image/gif"
+            ]
+            for att in attachments:
+                content_type = att.get('contentType') or att.get('@odata.mediaContentType')
+                if content_type in acceptable_content_types:
+                    file_name = att.get('name', 'attachment')
+                    content_bytes = att.get('contentBytes')
+                    if content_bytes:
+                        file_path = f"/tmp/{file_name}"
+                        with open(file_path, "wb") as f:
+                            f.write(base64.b64decode(content_bytes))
+                        valid_files.append(file_path)
+                        logging.info(f"Pobrano załącznik: {file_name}")
+
+            if not attachments or not valid_files:
+                send_email_ms_graph(
+                    to=sender_email,
+                    subject="Błąd pobierania załącznika",
+                    html_content=("Nie wykryto właściwego załącznika. "
+                                  "Prosimy o ponowne przesłanie dokumentu (w formacie PDF lub obrazu).")
+                )
+                raise AirflowSkipException("Brak właściwego załącznika do przetworzenia.")
+            
+            return {"sender": sender_email, "msg_id": msg_id, "attachments": valid_files}
+        except Exception as e:
+            logging.error(f"Błąd pobierania maili: {e}")
+            sender = None
+            try:
+                prev = kwargs.get('ti').xcom_pull(task_ids='pobierz_maile')
+                if prev and isinstance(prev, dict):
+                    sender = prev.get('sender')
+            except Exception:
+                sender = None
+            if sender:
+                send_email_ms_graph(
+                    to=sender,
+                    subject="Błąd pobierania maili (ERR01)",
+                    html_content="Błąd pobierania maili. Prosimy o kontakt z IT."
+                )
+            raise
+
+    # Task 2: Analiza dokumentów i ekstrakcja danych
+    def analizuj_dokumenty(ti, **kwargs):
+        try:
+            prev_data = ti.xcom_pull(task_ids='pobierz_maile')
+            if not prev_data:
+                logging.info("Brak danych mailowych do analizy. Kończę przebieg bez błędu.")
+                return []
+            sender_email = prev_data.get("sender")
+            attachments = prev_data.get("attachments", [])
+            if not attachments:
+                logging.info("Brak załączników do analizy. Kończę przebieg bez błędu.")
+                return []
+            fr_endpoint = Variable.get("order.form_recognizer_endpoint")
+            fr_key = Variable.get("order.form_recognizer_key")
+            fr_model_id = Variable.get("order.form_recognizer_model_id")
+            client = DocumentAnalysisClient(fr_endpoint, AzureKeyCredential(fr_key))
+            static_field_names = [
+                "ZamowienieNumer", "ZamawiającyNazwa", "ZamawiającyUlicaNumer",
+                "ZamawiającyMiejscowośćKodPocztowy", "ZamówienieDataDostawy",
+                "ZamówienieDataWystawienia", "ZamówienieWarunkipłatności",
+                "DostawaUlicaNumer", "DostawaMiejscowośćKodPocztowy", "DostawaKraj",
+                "DostawaFax", "ZamawiającyAdresPole", "ZamawiającyTelefon",
+                "ZamawiającySkładającyNazwa", "ZamawiającySkładającyTelefon",
+                "ZamawiającySkładającyEmail", "ZamawiającySkładającyUwagi",
+                "ZamawiającyNumerDostawacy", "ZamawiającyNIP", "ocr"
+            ]
+            table_mappings = {
+                "Tabela1": {"EAN": "EAN", "RWL": "RWLKOD", "ILOSC": "ILOSC", "ZAM": "ZAMKOD"},
+                "Tabela2": {"LP": "LP", "RWLKOD": "RWLKOD", "RWLNAZWA": "RWLNAZWA", "ILOSC": "ILOSC", "JM": "JM"},
+                "Tabela3": {"LP.": "LP", "RWLKOD": "RWLKOD", "RWLNAZWA": "RWLNAZWA", "EAN": "EAN", "JM": "JM", "ILOSC": "ILOSC"},
+                "Tabela4": {"l.p.": "LP", "EAN": "EAN", "RWLKOD": "RWLKOD", "RWLNAZWA": "RWLNAZWA", "ILOŚĆ": "ILOSC", "JM": "JM", "RABAT": "RABAT"},
+                "Tabela5": {"LP.": "LP", "ZAMKOD": "ZAMKOD", "RWLNAZWA": "RWLNAZWA", "RWLKOD": "RWLKOD", "ILOŚĆ": "ILOSC", "J.M.": "JM"},
+                "Tabela6": {"LP": "LP", "ZAMKOD": "ZAMKOD", "RWLKOD": "RWLKOD", "EAN": "EAN", "RWLNAZWA": "RWLNAZWA", "ILOSC": "ILOSC", "JM": "JM"},
+                "Tabela7": {"LP.": "LP", "RWLKOD": "RWLKOD", "RWLNAZWA": "RWLNAZWA", "ZAMKOD": "ZAMKOD", "ILOŚĆ": "ILOSC", "JM": "JM"},
+                "Tabela8": {"LP": "LP", "ZAMKOD": "ZAMKOD", "EAN": "EAN", "RWLKOD": "RWLKOD", "RWLNAZWA": "RWLNAZWA", "ILOŚĆ": "ILOSC"},
+                "Tabela9": {"LP": "LP", "EAN": "EAN", "RWLKOD": "RWLKOD", "ILOSC": "ILOSC", "JM": "JM"}
+            }
+            def parse_table(table_field, mapping_dict):
+                rows_result = []
+                if table_field and table_field.value_type == "list":
+                    for row_item in table_field.value:
+                        if row_item.value_type == "dictionary":
+                            row_dict = row_item.value
+                            normalized = {}
+                            for source_col, target_col in mapping_dict.items():
+                                sf = row_dict.get(source_col)
+                                if sf is None and source_col.lower() == "ilosc":
+                                    sf = row_dict.get("ILOŚĆ")
+                                normalized[target_col] = sf.value if (sf and sf.value is not None) else ""
+                            rows_result.append(normalized)
+                return rows_result
+
+            analysis_results = []
+            for file_path in attachments:
+                with open(file_path, "rb") as f:
+                    file_bytes = f.read()
+                logging.info(f"Przetwarzam załącznik: {file_path}")
+                if file_path.lower().endswith('.pdf'):
+                    pages = split_pdf_pages(file_bytes)
+                else:
+                    pages = [file_bytes]
+                logging.info(f"Plik {file_path} podzielony na {len(pages)} stron(y)/obraz(ów).")
+                extracted_fields = {}
+                lista_towarow = []
+                for page in pages:
+                    max_attempts = 3
+                    attempt = 0
+                    fr_result = None
+                    while attempt < max_attempts:
+                        try:
+                            fr_result = client.begin_analyze_document(model_id=fr_model_id, document=page).result()
+                            break
+                        except Exception as fr_error:
+                            attempt += 1
+                            logging.warning(f"Błąd analizy strony (próba {attempt}): {fr_error}")
+                            time.sleep(5)
+                    if not fr_result or not fr_result.documents:
+                        logging.error("Brak wyników analizy dla strony.")
+                        continue
+                    doc = fr_result.documents[0]
+                    fields = doc.fields
+                    for field in static_field_names:
+                        if not extracted_fields.get(field):
+                            extracted_fields[field] = safe_field_value(fields, field)
+                    for i in range(1, 10):
+                        t_name = f"Tabela{i}"
+                        if t_name in fields:
+                            table_field = fields[t_name]
+                            parsed_rows = parse_table(table_field, table_mappings.get(t_name, {}))
+                            lista_towarow.extend(parsed_rows)
+                analysis_results.append({
+                    "sender": sender_email,
+                    "order_fields": extracted_fields,
+                    "raw_items": lista_towarow,
+                    "order_items": lista_towarow,
+                    "attachment": file_path
+                })
+                logging.info(f"Dla załącznika {file_path} przetworzono dane: {json.dumps(lista_towarow, ensure_ascii=False)}")
+            logging.info(f"Przetworzono {len(analysis_results)} załączników.")
+            return analysis_results
+        except Exception as e:
+            logging.error(f"Błąd analizy dokumentu: {e}")
+            sender = None
+            try:
+                prev = kwargs.get('ti').xcom_pull(task_ids='pobierz_maile')
+                if prev and isinstance(prev, dict):
+                    sender = prev.get('sender')
+            except Exception:
+                sender = None
+            if sender:
+                send_email_ms_graph(
+                    to=sender,
+                    subject="Błąd analizy dokumentu (ERR02)",
+                    html_content="Wystąpił błąd podczas analizy dokumentu. Prosimy o kontakt z IT."
+                )
+            raise
+
+    # Task 3: Dopasowanie danych (fuzzy matching)
+    def dopasuj_dane(ti, **kwargs):
+        try:
+            prev_list = ti.xcom_pull(task_ids='analizuj_dokumenty')
+            if not prev_list or len(prev_list) == 0:
+                logging.info("Brak danych z analizy do dopasowania. Kończę przebieg.")
+                return []
+            results = []
+            db_host = Variable.get("order.db_host")
+            db_user = Variable.get("order.db_user")
+            db_password = Variable.get("order.db_password")
+            db_name = Variable.get("order.db_name")
+            connection = pymysql.connect(host=db_host, user=db_user, password=db_password, database=db_name, charset="utf8")
+            cursor = connection.cursor(pymysql.cursors.DictCursor)
+            cursor.execute("SELECT identifier, barcode, ecommerce_name_pl FROM beans")
+            products = cursor.fetchall()
+            logging.info(f"[DOPASUJ] Pobrano {len(products)} rekordów z bazy MariaDB.")
+            connection.close()
+
+            # Przygotowujemy klucze bez spacji – zarówno z bazy, jak i z analizowanych danych
+            product_by_identifier = {str(prod['identifier']).strip(): prod for prod in products if prod['identifier']}
+            # Zakładamy, że w bazie EAN są zapisane bez spacji
+            product_by_barcode = {re.sub(r"\s+", "", str(prod['barcode'])): prod for prod in products if prod['barcode']}
+            identifiers_list = list(product_by_identifier.keys())
+            names_list = [str(prod['ecommerce_name_pl']).strip() for prod in products if prod['ecommerce_name_pl']]
+
+            def fuzzy_match_identifier(code: str):
+                if not code:
+                    return (None, 0)
+                if code in identifiers_list:
+                    return (code, 100)
+                best = process.extractOne(code, identifiers_list, scorer=fuzz.ratio)
+                if best:
+                    best_id, score, _ = best
+                    return (best_id, score)
+                return (None, 0)
+
+            def fuzzy_match_name(name: str):
+                if not name:
+                    return (None, 0)
+                best = process.extractOne(name, names_list, scorer=fuzz.token_set_ratio)
+                if best:
+                    best_name, score, _ = best
+                    return (best_name, score)
+                return (None, 0)
+
+            for prev_data in prev_list:
+                sender_email = prev_data.get("sender")
+                order_items = prev_data.get("order_items", [])
+                raw_items = prev_data.get("raw_items", order_items)
+                if not order_items:
+                    continue
+                matched_items = []
+                for idx, item in enumerate(order_items, start=1):
+                    # Pobieramy EAN, usuwając wszystkie białe znaki
+                    ean_value = item.get("EAN", "")
+                    ean_value_clean = re.sub(r"\s+", "", ean_value)
+                    if ean_value_clean:
+                        prod = product_by_barcode.get(ean_value_clean)
+                        if prod:
+                            matched_code = prod.get("identifier", "")
+                            matched_name = prod.get("ecommerce_name_pl", "")
+                            # Używamy wartość z bazy – domyślnie zapisane bez spacji
+                            matched_ean = prod.get("barcode", "")
+                            logging.info(f"[DOPASUJ] Wiersz {idx}: Dopasowanie EAN (100%): {matched_code}, {matched_name}, {matched_ean}")
+                        else:
+                            logging.info(f"[DOPASUJ] Wiersz {idx}: EAN podany ({ean_value_clean}), ale brak dopasowania – zachowuję oryginalne dane.")
+                            matched_code = item.get("RWLKOD", "").strip()
+                            matched_name = item.get("RWLNAZWA", "").strip()
+                            matched_ean = ean_value_clean
+                    else:
+                        client_code = item.get("ZAMKOD", "").strip() or item.get("RWLKOD", "").strip()
+                        if not client_code:
+                            logging.info(f"[DOPASUJ] Wiersz {idx}: Brak kodu do dopasowania.")
+                            continue
+                        best_id, score = fuzzy_match_identifier(client_code)
+                        if best_id and score >= 80:
+                            prod = product_by_identifier.get(best_id)
+                            if prod:
+                                matched_code = prod.get("identifier", "")
+                                matched_name = prod.get("ecommerce_name_pl", "")
+                                matched_ean = prod.get("barcode", "")
+                                logging.info(f"[DOPASUJ] Wiersz {idx}: Fuzzy (identifier): {matched_code}, {matched_name}, {matched_ean} (score {score})")
+                            else:
+                                logging.info(f"[DOPASUJ] Wiersz {idx}: Brak produktu dla fuzzy identyfikatora {best_id}. Zachowuję oryginalne dane.")
+                                matched_code = item.get("RWLKOD", "").strip()
+                                matched_name = item.get("RWLNAZWA", "").strip()
+                                matched_ean = item.get("EAN", "").strip()
+                        else:
+                            search_name = item.get("order_name", "") or client_code
+                            best_name, score = fuzzy_match_name(search_name)
+                            if best_name and score >= 70:
+                                prod = next((p for p in product_by_identifier.values() if str(p.get("ecommerce_name_pl", "")).strip() == best_name), None)
+                                if prod:
+                                    matched_code = prod.get("identifier", "")
+                                    matched_name = prod.get("ecommerce_name_pl", "")
+                                    matched_ean = prod.get("barcode", "")
+                                    logging.info(f"[DOPASUJ] Wiersz {idx}: Fuzzy (name): {matched_code}, {matched_name}, {matched_ean} (score {score})")
+                                else:
+                                    logging.info(f"[DOPASUJ] Wiersz {idx}: Brak produktu dla fuzzy nazwy. Zachowuję oryginalne dane.")
+                                    matched_code = item.get("RWLKOD", "").strip()
+                                    matched_name = item.get("RWLNAZWA", "").strip()
+                                    matched_ean = item.get("EAN", "").strip()
+                            else:
+                                logging.info(f"[DOPASUJ] Wiersz {idx}: Brak wystarczającego dopasowania (best score {score}). Zachowuję oryginalne dane.")
+                                matched_code = item.get("RWLKOD", "").strip()
+                                matched_name = item.get("RWLNAZWA", "").strip()
+                                matched_ean = item.get("EAN", "").strip()
+                    matched_items.append({
+                        "LP": idx,
+                        "KOD KLIENTA": item.get("ZAMKOD", "").strip() or item.get("RWLKOD", "").strip(),
+                        "KOD PRODUKTU": matched_code,
+                        "NAZWA PRODUKTU": matched_name,
+                        "KOD EAN": matched_ean,
+                        "ILOSC": item.get("ILOSC", ""),
+                        "JM": item.get("JM", "")
+                    })
+                results.append({
+                    "sender": sender_email,
+                    "order_fields": prev_data.get("order_fields", {}),
+                    "matched_items": matched_items,
+                    "raw_items": raw_items,
+                    "attachment": prev_data.get("attachment")
+                })
+            total_rows = sum(len(r['matched_items']) for r in results)
+            logging.info(f"[DOPASUJ] Dopasowano {total_rows} wierszy łącznie.")
+            return results
+        except Exception as e:
+            logging.error(f"Błąd dopasowywania danych: {e}")
+            sender = None
+            try:
+                prev = kwargs.get('ti').xcom_pull(task_ids='analizuj_dokumenty')
+                if prev and isinstance(prev, list) and len(prev) > 0:
+                    sender = prev[0].get('sender')
+            except Exception:
+                sender = None
+            if sender:
+                send_email_ms_graph(
+                    to=sender,
+                    subject="Błąd dopasowywania (ERR03)",
+                    html_content="Wystąpił błąd przy dopasowywaniu danych zamówienia. Prosimy o kontakt z IT."
+                )
+            raise
+
+    # Task 4: Wysyłka wyniku – generowanie maila z dwiema tabelami HTML oraz załącznikami Excel
+    def wyslij_wynik(ti, **kwargs):
+        try:
+            prev_list = ti.xcom_pull(task_ids='dopasuj_dane')
+            if not prev_list or len(prev_list) == 0:
+                logging.info("Brak danych do wysłania wyniku. Kończę przebieg.")
+                return {"sender": ""}
+            for result in prev_list:
+                sender_email = result.get("sender")
+                order_fields = result.get("order_fields", {})
+                matched_items = result.get("matched_items", [])
+                html = """
+<html>
+  <body style="font-family: Aptos, sans-serif;">
+    <h3 style="font-size: 11px; margin-bottom: 5px;">Podsumowanie zamówienia</h3>
+    <table style="border-collapse: collapse; width: 100%; margin-bottom: 20px;">
+      <tr>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">Nazwa pola</th>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">Wartość</th>
+      </tr>
+                """
+                for klucz, wartosc in order_fields.items():
+                    html += f"""
+      <tr>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">{klucz}</td>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 10px;">{wartosc}</td>
+      </tr>
+                    """
+                html += """
+    </table>
+    <h3 style="font-size: 11px; margin-bottom: 5px;">Lista towarów</h3>
+    <table style="border-collapse: collapse; width: 100%;">
+      <tr>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">LP</th>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">KOD KLIENTA</th>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">KOD PRODUKTU</th>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">NAZWA PRODUKTU</th>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">KOD EAN</th>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px; text-align: right;">ILOSC</th>
+        <th style="border: 1px solid #ccc; padding: 4px; font-size: 11px;">JM</th>
+      </tr>
+                """
+                for towar in matched_items:
+                    html += f"""
+      <tr>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 10px;">{towar.get('LP', '')}</td>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 10px;">{towar.get('KOD KLIENTA', '')}</td>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 10px;">{towar.get('KOD PRODUKTU', '')}</td>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 10px;">{towar.get('NAZWA PRODUKTU', '')}</td>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 10px;">{towar.get('KOD EAN', '')}</td>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 10px; text-align: right;">{towar.get('ILOSC', '')}</td>
+        <td style="border: 1px solid #ccc; padding: 4px; font-size: 10px;">{towar.get('JM', '')}</td>
+      </tr>
+                    """
+                html += """
+    </table>
+  </body>
+</html>
+                """
+                raw_excel_bytes = generate_excel_additional_raw(result.get("raw_items", []))
+                fuzzy_excel_bytes = generate_excel_additional_fuzzy(result.get("matched_items", []))
+                raw_excel_b64 = base64.b64encode(raw_excel_bytes).decode("utf-8")
+                fuzzy_excel_b64 = base64.b64encode(fuzzy_excel_bytes).decode("utf-8")
+                attachments = [
+                    {
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": "ListaTowarow.xlsx",
+                        "contentBytes": raw_excel_b64,
+                        "contentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    },
+                    {
+                        "@odata.type": "#microsoft.graph.fileAttachment",
+                        "name": "ListaTowarowDopasowana.xlsx",
+                        "contentBytes": fuzzy_excel_b64,
+                        "contentType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    }
+                ]
+                subject = f"Wynik analizy zamówienia dla załącznika: {result.get('attachment').split('/')[-1]}"
+                logging.info(f"Wysyłam maila dla załącznika {result.get('attachment')}.")
+                send_email_ms_graph(to=sender_email, subject=subject, html_content=html, attachments=attachments)
+            return {"sender": prev_list[0].get("sender")}
+        except Exception as e:
+            logging.error(f"Błąd wysyłania wyniku: {e}")
+            sender = None
+            try:
+                prev = kwargs.get('ti').xcom_pull(task_ids='dopasuj_dane')
+                if prev and isinstance(prev, list) and len(prev) > 0:
+                    sender = prev[0].get('sender')
+            except Exception:
+                sender = None
+            if sender:
+                send_email_ms_graph(
+                    to=sender,
+                    subject="Błąd wysyłki wyniku (ERR04)",
+                    html_content="Wystąpił błąd podczas wysyłki wyniku. Prosimy o kontakt z IT."
+                )
+            raise
+
+    # Task 5: Oznaczanie maila jako przetworzonego
+    def oznacz_przetworzone(ti, **kwargs):
+        try:
+            prev_data = ti.xcom_pull(task_ids='pobierz_maile')
+            if not prev_data:
+                logging.info("Brak danych do oznaczenia maila. Zadanie 'oznacz_przetworzone' zakończone bez błędu.")
+                return {"info": "Brak maila do oznaczenia"}
+            msg_id = prev_data.get("msg_id")
+            if not msg_id:
+                logging.info("Brak identyfikatora maila do oznaczenia. Zadanie 'oznacz_przetworzone' zakończone bez błędu.")
+                return {"info": "Brak maila do oznaczenia"}
+            email_account = Variable.get("order.email_account")
+            tenant_id = Variable.get("order.tenant_id")
+            client_id = Variable.get("order.client_id")
+            client_secret = Variable.get("order.client_secret")
+            authority = f"https://login.microsoftonline.com/{tenant_id}"
+            app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
+            result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
+            if not result or "access_token" not in result:
+                raise Exception("Błąd uwierzytelnienia przy oznaczaniu maila")
+            token = result["access_token"]
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            end_folder_id = Variable.get("order.end_folder_id")
+            move_url = f"https://graph.microsoft.com/v1.0/users/{email_account}/messages/{msg_id}/move"
+            move_data = {"destinationId": end_folder_id}
+            move_resp = requests.post(move_url, headers=headers, json=move_data)
+            move_resp.raise_for_status()
+            moved_message = move_resp.json()
+            new_msg_id = moved_message.get("id")
+            if new_msg_id:
+                msg_id = new_msg_id
+            patch_url = f"https://graph.microsoft.com/v1.0/users/{email_account}/messages/{msg_id}"
+            patch_data = {"isRead": True}
+            response = requests.patch(patch_url, headers=headers, json=patch_data)
+            response.raise_for_status()
+            logging.info("Mail oznaczony jako przetworzony i przeniesiony do folderu 'end'.")
+        except Exception as e:
+            logging.error(f"Błąd oznaczania maila: {e}")
+            sender = None
+            try:
+                prev = kwargs.get('ti').xcom_pull(task_ids='pobierz_maile')
+                if prev and isinstance(prev, dict):
+                    sender = prev.get('sender')
+            except Exception:
+                sender = None
+            if sender:
+                send_email_ms_graph(
+                    to=sender,
+                    subject="Błąd oznaczania maila (ERR05)",
+                    html_content="Wystąpił błąd przy oznaczaniu maila jako przetworzonego. Prosimy o kontakt z IT."
+                )
+            raise
+
+    # Definicja tasków i kolejność wykonywania
+    pobierz_task = PythonOperator(
+        task_id="pobierz_maile",
+        python_callable=pobierz_maile,
+        provide_context=True,
+        pool="sprawdzenie_maili"
+    )
+    analizuj_task = PythonOperator(
+        task_id="analizuj_dokumenty",
+        python_callable=analizuj_dokumenty,
+        provide_context=True
+    )
+    dopasuj_task = PythonOperator(
+        task_id="dopasuj_dane",
+        python_callable=dopasuj_dane,
+        provide_context=True
+    )
+    wyslij_task = PythonOperator(
+        task_id="wyslij_wynik",
+        python_callable=wyslij_wynik,
+        provide_context=True
+    )
+    oznacz_task = PythonOperator(
+        task_id="oznacz_przetworzone",
+        python_callable=oznacz_przetworzone,
+        provide_context=True
+    )
+
+    pobierz_task >> analizuj_task >> dopasuj_task >> wyslij_task >> oznacz_task
